@@ -361,7 +361,19 @@ open class ImageCache: @unchecked Sendable {
         
         ioQueue.async {
             let serializer = options.cacheSerializer
-            if let data = serializer.data(with: image, original: original) {
+            // For a `DefaultCacheSerializer`, when the processor has not altered the image (so `image` still
+            // matches whatever `original` decodes to), prefer keeping `original`'s bytes verbatim for a format
+            // Kingfisher cannot itself re-encode (such as WebP or HEIC) instead of inflating the disk cache with a
+            // re-encoded PNG. This is unsafe to do when a non-default processor may have changed the image content.
+            let data: Data?
+            if let defaultSerializer = serializer as? DefaultCacheSerializer,
+               options.processor == DefaultImageProcessor.default
+            {
+                data = defaultSerializer.data(with: image, original: original, preserveUnrecognizedFormat: true)
+            } else {
+                data = serializer.data(with: image, original: original)
+            }
+            if let data = data {
                 self.syncStoreToDisk(
                     data,
                     forKey: key,

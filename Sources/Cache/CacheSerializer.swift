@@ -83,6 +83,12 @@ public extension CacheSerializer {
 ///
 /// > Tip: If you create a new image instance from an animated image in a custom processor, use
 /// > ``KingfisherWrapper/copyKingfisherState(to:)`` to propagate the embedded animated data to the new image.
+///
+/// > Note: When the image is cached through ``ImageCache/store(_:original:forKey:options:toDisk:completionHandler:)``
+/// > with no ``ImageProcessor`` other than ``DefaultImageProcessor``, Kingfisher keeps `original`'s bytes as-is for
+/// > formats it cannot recognize (such as WebP or HEIC) instead of re-encoding them as PNG, to avoid unnecessarily
+/// > inflating the disk cache. This optimization is skipped whenever a custom processor is used, since the processor
+/// > may have altered the image so it no longer matches `original`.
 public struct DefaultCacheSerializer: CacheSerializer {
     
     /// The default general cache serializer utilized throughout Kingfisher's caching mechanism.
@@ -109,6 +115,17 @@ public struct DefaultCacheSerializer: CacheSerializer {
     public init() { }
 
     public func data(with image: KFCrossPlatformImage, original: Data?) -> Data? {
+        data(with: image, original: original, preserveUnrecognizedFormat: false)
+    }
+
+    /// Returns the data to be stored to the disk cache for `image`.
+    ///
+    /// - Parameter preserveUnrecognizedFormat: Whether the raw `original` bytes should be kept as-is when their
+    /// format is not one of PNG/JPEG/GIF (for example, WebP or HEIC), instead of falling back to a re-encoded PNG.
+    /// This is only safe to request when the caller can guarantee `image` was not altered (for example, by an
+    /// ``ImageProcessor``) from what `original` decodes to, since in that case the raw bytes no longer represent
+    /// `image`.
+    func data(with image: KFCrossPlatformImage, original: Data?, preserveUnrecognizedFormat: Bool) -> Data? {
         let format: ImageFormat = {
             if let original = original { return original.kf.imageFormat }
 
@@ -121,6 +138,10 @@ public struct DefaultCacheSerializer: CacheSerializer {
         if preferCacheOriginalData {
             if let original = original { return original }
             if format == .GIF { return image.kf.gifRepresentation() }
+        }
+
+        if preserveUnrecognizedFormat, format == .unknown, let original = original {
+            return original
         }
 
         return image.kf.data(format: format, compressionQuality: compressionQuality)

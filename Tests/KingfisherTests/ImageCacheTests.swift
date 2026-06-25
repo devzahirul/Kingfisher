@@ -246,6 +246,61 @@ class ImageCacheTests: XCTestCase {
         waitForExpectations(timeout: 3, handler: nil)
     }
 
+    // A fake WebP-like payload. Its header does not match the PNG/JPEG/GIF magic bytes Kingfisher recognizes,
+    // so `Data.kf.imageFormat` resolves it to `.unknown`, the same way a real WebP/HEIC payload would.
+    private var unrecognizedFormatData: Data {
+        Data([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50])
+    }
+
+    func testStoreUnrecognizedFormatToDiskWithDefaultProcessorShouldPreserveOriginalBytes() {
+        let exp = expectation(description: #function)
+        let original = unrecognizedFormatData
+        let options = KingfisherParsedOptionsInfo(nil)
+        let key = "test-unrecognized-format-default-processor"
+        cache.store(testImage, original: original, forKey: key, options: options, toDisk: true) { _ in
+            do {
+                let storedKey = key.computedKey(with: DefaultImageProcessor.default.identifier)
+                let storedData = try self.cache.diskStorage.value(forKey: storedKey)
+                XCTAssertEqual(storedData, original)
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+            exp.fulfill()
+        }
+        waitForExpectations(timeout: 3, handler: nil)
+    }
+
+    func testStoreUnrecognizedFormatToDiskWithCustomProcessorShouldNotUseOriginalBytes() {
+        struct TestProcessor: ImageProcessor {
+            let identifier: String = "com.onevcat.KingfisherTests.TestProcessor.UnrecognizedFormat"
+            func process(item: ImageProcessItem, options: KingfisherParsedOptionsInfo) -> KFCrossPlatformImage? {
+                switch item {
+                case .image(let image): return image
+                case .data(let data): return DefaultImageProcessor.default.process(item: .data(data), options: options)
+                }
+            }
+        }
+
+        let exp = expectation(description: #function)
+        let original = unrecognizedFormatData
+        let options = KingfisherParsedOptionsInfo([.processor(TestProcessor())])
+        let key = "test-unrecognized-format-custom-processor"
+        cache.store(testImage, original: original, forKey: key, options: options, toDisk: true) { _ in
+            do {
+                let storedKey = key.computedKey(with: TestProcessor().identifier)
+                let storedData = try self.cache.diskStorage.value(forKey: storedKey)
+                // A non-default processor may have altered `testImage` relative to `original`, so Kingfisher must
+                // not assume the raw `original` bytes still represent it; it falls back to re-encoding `testImage`.
+                XCTAssertNotEqual(storedData, original)
+                XCTAssertEqual(storedData?.kf.imageFormat, .PNG)
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+            exp.fulfill()
+        }
+        waitForExpectations(timeout: 3, handler: nil)
+    }
+
     func testCopyKingfisherStateShouldKeepEmbeddedGIFDataForDiskCache() {
         struct TestProcessor: ImageProcessor {
             let identifier: String = "com.onevcat.KingfisherTests.TestProcessor.CopyState"
