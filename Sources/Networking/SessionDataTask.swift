@@ -87,7 +87,14 @@ public class SessionDataTask: @unchecked Sendable {
     let onTaskDone = Delegate<(Result<(Data, URLResponse?), KingfisherError>, [TaskCallback]), Void>()
     let onCallbackCancelled = Delegate<(CancelToken, TaskCallback), Void>()
 
-    var started = false
+    private var _started = false
+    /// Whether the underlying task has been resumed. Guarded by `lock` so it is safe to read while
+    /// another thread may be resuming the task (e.g. concurrent same-URL requests coalescing).
+    var started: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _started
+    }
     var containsCallbacks: Bool {
         // We should be able to use `task.state != .running` to check it.
         // However, in some rare cases, cancelling the task does not change
@@ -143,8 +150,12 @@ public class SessionDataTask: @unchecked Sendable {
     }
 
     func resume() {
-        guard !started else { return }
-        started = true
+        lock.lock()
+        let alreadyStarted = _started
+        _started = true
+        lock.unlock()
+        // Resume only once, and outside the lock so the `URLSession` call is not made while holding it.
+        guard !alreadyStarted else { return }
         task.resume()
     }
 

@@ -125,6 +125,43 @@ class ImageDownloaderTests: XCTestCase {
         waitForExpectations(timeout: 5, handler: nil)
     }
     
+    // Concurrency regression guard for `addDownloadTask` (issue #2231): firing many concurrent
+    // requests for the same URL must coalesce onto one in-flight task and deliver *every* callback —
+    // none dropped. With the atomic look-up-or-create in `SessionDelegate` this holds without the
+    // downloader holding a process-wide lock across task creation.
+    func testConcurrentSameURLDownloadsDeliverEveryCallback() {
+        let exp = expectation(description: #function)
+        let url = testURLs[0]
+        let stub = delayedStub(url, data: testImageData)
+
+        let count = 50
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "test.concurrent.sameurl", attributes: .concurrent)
+        let lock = NSLock()
+        var succeeded = 0
+
+        for _ in 0..<count {
+            group.enter()
+            queue.async {
+                self.downloader.downloadImage(with: url) { result in
+                    if result.value != nil {
+                        lock.lock(); succeeded += 1; lock.unlock()
+                    }
+                    group.leave()
+                }
+            }
+        }
+
+        // Let the concurrent registrations pile up onto the single in-flight task, then respond.
+        delay(0.3) { _ = stub.go() }
+
+        group.notify(queue: .main) {
+            XCTAssertEqual(succeeded, count, "every concurrent same-URL request must receive its callback")
+            exp.fulfill()
+        }
+        waitForExpectations(timeout: 5, handler: nil)
+    }
+
     func testDownloadWithModifyingRequest() {
         let exp = expectation(description: #function)
 

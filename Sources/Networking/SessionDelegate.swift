@@ -43,8 +43,7 @@ open class SessionDelegate: NSObject, @unchecked Sendable {
         URLAuthenticationChallenge
     )
 
-    private var tasks: [URL: SessionDataTask] = [:]
-    private let lock = NSLock()
+    private let tasks = Protected<[URL: SessionDataTask]>([:])
 
     let onValidStatusCode = Delegate<Int, Bool>()
     let onResponseReceived = Delegate<URLResponse, URLSession.ResponseDisposition>()
@@ -54,15 +53,41 @@ open class SessionDelegate: NSObject, @unchecked Sendable {
     let onReceiveSessionChallenge = Delegate<SessionChallengeFunc, (URLSession.AuthChallengeDisposition, URLCredential?)>()
     let onReceiveSessionTaskChallenge = Delegate<SessionTaskChallengeFunc, (URLSession.AuthChallengeDisposition, URLCredential?)>()
 
-    func add(
+    /// Atomically registers `callback` on the in-flight task for `url`, if one exists and still accepts
+    /// callbacks. Returns `nil` when there is no joinable task, in which case the caller should create a
+    /// new `URLSessionDataTask` and install it via ``insertOrAppend(_:url:callback:)``.
+    func appendCallback(_ callback: SessionDataTask.TaskCallback, forKey url: URL) -> DownloadTask? {
+        tasks.withLock { tasks in
+            guard let task = tasks[url], let token = task.addCallback(callback) else {
+                return nil
+            }
+            return DownloadTask(sessionTask: task, cancelToken: token)
+        }
+    }
+
+    /// Atomically registers `callback`, joining an existing in-flight task for `url` if present, otherwise
+    /// installing `dataTask` as the task for `url`.
+    ///
+    /// `dataTask` is created by the caller *outside* any lock (it can be a comparatively expensive
+    /// Foundation call). If a concurrent caller installed a task for the same `url` first, that task is
+    /// reused and the passed-in `dataTask` is discarded — it is never resumed.
+    func insertOrAppend(
         _ dataTask: URLSessionDataTask,
         url: URL,
         callback: SessionDataTask.TaskCallback) -> DownloadTask
     {
-        lock.lock()
-        defer { lock.unlock() }
+        tasks.withLock { tasks in
+            if let existing = tasks[url], let token = existing.addCallback(callback) {
+                return DownloadTask(sessionTask: existing, cancelToken: token)
+            }
+            let task = makeSessionDataTask(dataTask)
+            let token = task.addCallback(callback)!
+            tasks[url] = task
+            return DownloadTask(sessionTask: task, cancelToken: token)
+        }
+    }
 
-        // Create a new task if necessary.
+    private func makeSessionDataTask(_ dataTask: URLSessionDataTask) -> SessionDataTask {
         let task = SessionDataTask(task: dataTask)
         task.onCallbackCancelled.delegate(on: self) { [weak task] (self, value) in
             guard let task = task else { return }
@@ -79,73 +104,53 @@ open class SessionDelegate: NSObject, @unchecked Sendable {
                 self.remove(task)
             }
         }
-        let token = task.addCallback(callback)!
-        tasks[url] = task
-        return DownloadTask(sessionTask: task, cancelToken: token)
+        return task
     }
 
     private func cancelTask(_ dataTask: URLSessionDataTask) {
-        lock.lock()
-        defer { lock.unlock() }
         dataTask.cancel()
     }
 
-    func append(
-        _ task: SessionDataTask,
-        callback: SessionDataTask.TaskCallback) -> DownloadTask?
-    {
-        guard let token = task.addCallback(callback) else { return nil }
-        return DownloadTask(sessionTask: task, cancelToken: token)
-    }
-
     private func remove(_ task: SessionDataTask) {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let url = task.originalURL else {
             return
         }
-        task.removeAllCallbacks()
-        if tasks[url] === task {
-            tasks[url] = nil
+        tasks.withLock { tasks in
+            task.removeAllCallbacks()
+            if tasks[url] === task {
+                tasks[url] = nil
+            }
         }
     }
 
     private func task(for task: URLSessionTask) -> SessionDataTask? {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard let url = task.originalRequest?.url else {
             return nil
         }
-        guard let sessionTask = tasks[url] else {
-            return nil
+        return tasks.withLock { tasks in
+            guard let sessionTask = tasks[url] else {
+                return nil
+            }
+            guard sessionTask.task.taskIdentifier == task.taskIdentifier else {
+                return nil
+            }
+            return sessionTask
         }
-        guard sessionTask.task.taskIdentifier == task.taskIdentifier else {
-            return nil
-        }
-        return sessionTask
     }
 
     func task(for url: URL) -> SessionDataTask? {
-        lock.lock()
-        defer { lock.unlock() }
-        return tasks[url]
+        tasks.withLock { $0[url] }
     }
 
     func cancelAll() {
-        lock.lock()
-        let taskValues = tasks.values
-        lock.unlock()
+        let taskValues = tasks.withLock { Array($0.values) }
         for task in taskValues {
             task.forceCancel()
         }
     }
 
     func cancel(url: URL) {
-        lock.lock()
-        let task = tasks[url]
-        lock.unlock()
+        let task = tasks.withLock { $0[url] }
         task?.forceCancel()
     }
 }
