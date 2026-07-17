@@ -292,8 +292,6 @@ open class ImageDownloader: @unchecked Sendable {
     // The session bound to the downloader.
     private var session: URLSession
 
-    private let lock = NSLock()
-
     // MARK: Initializers
 
     /// Creates a downloader with a given name.
@@ -421,21 +419,20 @@ open class ImageDownloader: @unchecked Sendable {
         callback: SessionDataTask.TaskCallback
     ) -> DownloadTask
     {
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Ready to start download. Add it to session task manager (`sessionHandler`)
-        let downloadTask: DownloadTask
-        if let existingTask = sessionDelegate.task(for: context.url),
-           let existingDownloadTask = sessionDelegate.append(existingTask, callback: callback)
-        {
-            downloadTask = existingDownloadTask
-        } else {
-            let sessionDataTask = session.dataTask(with: context.request)
-            sessionDataTask.priority = context.options.downloadPriority
-            downloadTask = sessionDelegate.add(sessionDataTask, url: context.url, callback: callback)
+        // Fast path: join an existing in-flight download for this URL. The lookup-and-append is atomic
+        // inside `SessionDelegate`, so concurrent same-URL requests coalesce onto a single network task
+        // without dropping callbacks (issue #2231) — and without holding a downloader-wide lock.
+        if let downloadTask = sessionDelegate.appendCallback(callback, forKey: context.url) {
+            return downloadTask
         }
-        return downloadTask
+
+        // Slow path: create the `URLSessionDataTask` *outside* any lock (it is a comparatively expensive
+        // Foundation call, and this method frequently runs on the main thread), then atomically install
+        // it. If a concurrent caller installed a task for the same URL first, that one is reused and this
+        // freshly created task is discarded.
+        let sessionDataTask = session.dataTask(with: context.request)
+        sessionDataTask.priority = context.options.downloadPriority
+        return sessionDelegate.insertOrAppend(sessionDataTask, url: context.url, callback: callback)
     }
 
     private func reportWillDownloadImage(url: URL, request: URLRequest) {
